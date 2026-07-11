@@ -62,7 +62,7 @@ class Config:
     RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", 60))
 
     # ── Admin ─────────────────────────────────────────────────────────────────
-    ADMIN_REGISTRATION_SECRET = _require_env("ADMIN_REGISTRATION_SECRET", "codiora123")
+    ADMIN_REGISTRATION_SECRET = _require_env("ADMIN_REGISTRATION_SECRET", "admin123")
 
     # ── Caching ───────────────────────────────────────────────────────────────
     CACHE_TYPE = "SimpleCache"
