@@ -1,0 +1,12 @@
+Flask
+Flask-SQLAlchemy
+Flask-Bcrypt
+Flask-JWT-Extended
+Flask-Cors
+Flask-Caching
+flasgger
+Werkzeug
+Pillow
+psycopg2-binary
+python-dotenv
+gunicorn
