@@ -2,7 +2,6 @@ import os
 import re
 import uuid
 from functools import wraps
-from datetime import datetime, timezone
 
 from flask import jsonify, current_app, request
 from flask_jwt_extended import get_jwt_identity
@@ -11,15 +10,13 @@ from werkzeug.utils import secure_filename
 from extensions import db
 from models import User, ActivityLog
 
-# ── Regex patterns ────────────────────────────────────────────────────────────
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-URL_RE = re.compile(r"^(https?://).+", re.IGNORECASE)
+URL_RE = re.compile(r"^https?://[^\s]+$", re.IGNORECASE)
+CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
-
-# ── String validation ─────────────────────────────────────────────────────────
 
 def is_valid_email(email):
-    return bool(email and EMAIL_RE.match(email))
+    return bool(email and EMAIL_RE.fullmatch(email))
 
 
 def clean_string(value, max_length=None, required=False, field_name="field"):
@@ -27,40 +24,71 @@ def clean_string(value, max_length=None, required=False, field_name="field"):
         if required:
             raise ValueError(f"{field_name} is required")
         return None
+
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string")
-    value = value.strip()
+
+    value = CONTROL_CHARS_RE.sub("", value).strip()
+
     if required and not value:
         raise ValueError(f"{field_name} is required")
+
     if max_length and len(value) > max_length:
-        raise ValueError(f"{field_name} must be at most {max_length} characters")
+        raise ValueError(
+            f"{field_name} must be at most {max_length} characters"
+        )
+
     return value
 
 
 def validate_url_or_none(value, field_name):
-    value = clean_string(value, max_length=255, field_name=field_name)
+    value = clean_string(
+        value,
+        max_length=255,
+        field_name=field_name
+    )
+
     if not value:
         return None
-    if not URL_RE.match(value):
-        raise ValueError(f"{field_name} must start with http:// or https://")
+
+    if not URL_RE.fullmatch(value):
+        raise ValueError(
+            f"{field_name} must be a valid http:// or https:// URL"
+        )
+
     return value
 
 
 def validate_password_strength(password):
-    """
-    Enforce password rules:
-    - At least 8 characters
-    - At least one letter
-    - At least one digit
-    Returns an error string or None if valid.
-    """
     if not isinstance(password, str) or len(password) < 8:
         return "password must be at least 8 characters"
-    if not any(c.isalpha() for c in password):
+
+    if len(password) > 128:
+        return "password must be at most 128 characters"
+
+    if not any(character.isalpha() for character in password):
         return "password must contain at least one letter"
-    if not any(c.isdigit() for c in password):
+
+    if not any(character.isdigit() for character in password):
         return "password must contain at least one number"
+
     return None
+
+
+def require_json_object():
+    if not request.is_json:
+        raise ValueError(
+            "Content-Type must be application/json"
+        )
+
+    data = request.get_json(silent=True)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            "request body must be a JSON object"
+        )
+
+    return data
 
 
 def parse_positive_int(value, default, max_value=100):
@@ -68,8 +96,10 @@ def parse_positive_int(value, default, max_value=100):
         number = int(value)
     except (TypeError, ValueError):
         number = default
+
     if number < 1:
         number = default
+
     return min(number, max_value)
 
 
@@ -84,90 +114,192 @@ def pagination_meta(pagination):
     }
 
 
-# ── Role-based access ─────────────────────────────────────────────────────────
-
-def admin_required(fn):
-    """Decorator: restricts endpoint to admin users only."""
-    @wraps(fn)
+def admin_required(function):
+    @wraps(function)
     def wrapper(*args, **kwargs):
-        user_id = get_jwt_identity()
-        user = User.query.get(user_id)
+        user = db.session.get(
+            User,
+            int(get_jwt_identity())
+        )
+
         if not user or user.role != "admin":
-            return jsonify({"error": "admin permission required"}), 403
-        return fn(*args, **kwargs)
+            return jsonify({
+                "error": "admin permission required"
+            }), 403
+
+        return function(*args, **kwargs)
+
     return wrapper
 
 
-# ── Activity logging ──────────────────────────────────────────────────────────
-
-def log_activity(user_id, action, description=None, resource_type=None, resource_id=None):
-    log = ActivityLog(
-        user_id=user_id,
-        action=action,
-        description=description,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        ip_address=request.headers.get("X-Forwarded-For", request.remote_addr),
-        user_agent=request.headers.get("User-Agent"),
+def log_activity(
+    user_id,
+    action,
+    description=None,
+    resource_type=None,
+    resource_id=None
+):
+    forwarded = request.headers.get(
+        "X-Forwarded-For",
+        ""
     )
-    db.session.add(log)
 
+    ip_address = (
+        forwarded.split(",")[0].strip()
+        if forwarded
+        else request.remote_addr
+    )
 
-# ── Image upload & processing ─────────────────────────────────────────────────
+    db.session.add(
+        ActivityLog(
+            user_id=int(user_id),
+            action=action,
+            description=description,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            ip_address=ip_address,
+            user_agent=(
+                request.headers.get("User-Agent") or ""
+            )[:255],
+        )
+    )
+
 
 def allowed_image(filename):
-    allowed = current_app.config.get("ALLOWED_IMAGE_EXTENSIONS", {"png","jpg","jpeg","gif","webp"})
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed
+    allowed_extensions = current_app.config.get(
+        "ALLOWED_IMAGE_EXTENSIONS",
+        set()
+    )
+
+    return (
+        "." in filename
+        and filename.rsplit(".", 1)[1].lower()
+        in allowed_extensions
+    )
 
 
 def save_uploaded_image(file_storage, folder_name):
-    """
-    Validate, resize, and save an uploaded image.
-    Returns a publicly accessible URL path like /uploads/profiles/abc123.jpg
-    Raises ValueError with a user-friendly message on any problem.
-    """
     if not file_storage or not file_storage.filename:
         raise ValueError("image file is required")
+
     if not allowed_image(file_storage.filename):
-        raise ValueError("only png, jpg, jpeg, gif, and webp files are allowed")
+        raise ValueError(
+            "only png, jpg, jpeg, gif, and webp files are allowed"
+        )
 
-    original_name = secure_filename(file_storage.filename)
-    ext = original_name.rsplit(".", 1)[1].lower()
-    safe_name = f"{uuid.uuid4().hex}.{ext}"
+    original_name = secure_filename(
+        file_storage.filename
+    )
 
-    upload_root = current_app.config["UPLOAD_FOLDER"]
-    target_folder = os.path.join(upload_root, folder_name)
-    os.makedirs(target_folder, exist_ok=True)
-    file_path = os.path.join(target_folder, safe_name)
+    extension = original_name.rsplit(
+        ".",
+        1
+    )[1].lower()
 
-    # Resize image to max dimension to save storage and improve performance
+    safe_name = (
+        f"{uuid.uuid4().hex}.{extension}"
+    )
+
+    target_folder = os.path.join(
+        current_app.config["UPLOAD_FOLDER"],
+        folder_name
+    )
+
+    os.makedirs(
+        target_folder,
+        exist_ok=True
+    )
+
+    file_path = os.path.join(
+        target_folder,
+        safe_name
+    )
+
     try:
-        from PIL import Image
-        max_dim = current_app.config.get("IMAGE_MAX_DIMENSION", 1024)
-        img = Image.open(file_storage)
-        img.thumbnail((max_dim, max_dim))
-        # Convert palette/RGBA to RGB for JPEGs
-        if ext in ("jpg", "jpeg") and img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        img.save(file_path, optimize=True, quality=85)
-    except Exception:
-        # Fallback: save raw without processing
-        file_storage.seek(0)
-        file_storage.save(file_path)
+        from PIL import Image, UnidentifiedImageError
 
-    return f"/uploads/{folder_name}/{safe_name}"
+        file_storage.stream.seek(0)
+
+        with Image.open(file_storage.stream) as image:
+            image.verify()
+
+        file_storage.stream.seek(0)
+
+        with Image.open(file_storage.stream) as image:
+            maximum_dimension = current_app.config.get(
+                "IMAGE_MAX_DIMENSION",
+                1024
+            )
+
+            image.thumbnail(
+                (
+                    maximum_dimension,
+                    maximum_dimension
+                )
+            )
+
+            if (
+                extension in ("jpg", "jpeg")
+                and image.mode not in ("RGB", "L")
+            ):
+                image = image.convert("RGB")
+
+            image.save(
+                file_path,
+                optimize=True,
+                quality=85
+            )
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+        ValueError
+    ) as error:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        raise ValueError(
+            "uploaded file is not a valid image"
+        ) from error
+
+    return (
+        f"/uploads/{folder_name}/{safe_name}"
+    )
 
 
 def delete_old_image(url_path):
-    """Delete an old image file from disk when replaced."""
-    if not url_path:
+    if (
+        not url_path
+        or not url_path.startswith("/uploads/")
+    ):
         return
+
     try:
-        upload_root = current_app.config["UPLOAD_FOLDER"]
-        # url_path is like /uploads/profiles/abc.jpg
-        relative = url_path.lstrip("/uploads/")
-        full_path = os.path.join(upload_root, relative)
-        if os.path.exists(full_path):
+        relative_path = url_path[
+            len("/uploads/"):
+        ]
+
+        upload_root = os.path.realpath(
+            current_app.config["UPLOAD_FOLDER"]
+        )
+
+        full_path = os.path.realpath(
+            os.path.join(
+                upload_root,
+                relative_path
+            )
+        )
+
+        if (
+            full_path.startswith(
+                upload_root + os.sep
+            )
+            and os.path.isfile(full_path)
+        ):
             os.remove(full_path)
-    except Exception:
-        pass  # Non-critical — don't break the request if cleanup fails
+
+    except OSError:
+        current_app.logger.warning(
+            "Could not delete old image: %s",
+            url_path
+        )

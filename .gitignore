@@ -34,3 +34,7 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Week 6 runtime data
+backups/
+.pytest_cache/

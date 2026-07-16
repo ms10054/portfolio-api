@@ -10,3 +10,5 @@ Pillow
 psycopg2-binary
 python-dotenv
 gunicorn
+
+pytest
